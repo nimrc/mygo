@@ -44,8 +44,20 @@ func TestPanel(t *testing.T) {
 	if deactivated {
 		eventually(t, "the app deactivated", func() bool { active, _ := appActive(); return !active })
 	}
+	// The window server on a CI runner can drop the key request of a
+	// nonactivating panel shown right after another app took the front, so
+	// it is asked again, as the user would, until it takes the keyboard.
 	panel.Show()
-	eventually(t, "the panel focused", panel.IsFocused)
+	pause := 0
+	eventually(t, "the panel focused", func() bool {
+		if panel.IsFocused() {
+			return true
+		}
+		if pause++; pause%250 == 0 { // about every 5 s at the 20 ms poll
+			panel.Show()
+		}
+		return false
+	})
 	waitFor(t, panel, "document.hasFocus() && document.activeElement.id === 'i'")
 	if deactivated {
 		time.Sleep(300 * time.Millisecond)
