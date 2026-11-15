@@ -226,6 +226,7 @@ func (w *window) createSurface() {
 	loadSurface()
 	data := ptr(w.id)
 	s := &surface{w: w}
+	s.touch.pointer = w.opts.TouchPointer || os.Getenv("MYGO_TOUCH_POINTER") == "1"
 	s.im = gtkIMMulticontextNew()
 	s.newArea(gtkGLAreaNew != nil && os.Getenv("MYGO_GPU") != "0" && gpuGL())
 	connect(s.im, "commit", cbIMCommit, data)
@@ -847,9 +848,9 @@ func (s *surface) touchEvent(typ int32, event ptr) {
 		if field[int32](event, 64) != 0 {
 			// The first finger of new touches: no other is down, whatever
 			// ended unseen, as under a grab.
-			s.touch.fingers = s.touch.fingers[:0]
+			evs = s.touch.reset()
 		}
-		evs = s.touch.begin(seq, x, y, t)
+		evs = append(evs, s.touch.begin(seq, x, y, t)...)
 	case 38:
 		evs = s.touch.move(seq, x, y)
 	default:
