@@ -7,8 +7,10 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/egoist/mygo/internal/gpu"
 	"github.com/egoist/mygo/internal/gpu/gputest"
 	"github.com/egoist/mygo/internal/raster"
+	"github.com/egoist/mygo/internal/scene"
 )
 
 // apis are the APIs the renderer draws with: OpenGL 3.3 and OpenGL ES 3.0.
@@ -104,6 +106,71 @@ func TestDrawsAsTheCPURenderer(t *testing.T) {
 					t.Fatal(err)
 				}
 				gputest.Compare(t, "gl-corner-clips", read(), s.Width*4, s)
+			}
+		})
+	}
+}
+
+// TestClassesDrawAsTheGeneralShader draws scenes with the program of
+// each batch's class (gpu.Class) and with the general one alone, and
+// requires the same pixels, but for a rounding here and there: the
+// compiler fuses a shorter shader's arithmetic its own way.
+func TestClassesDrawAsTheGeneralShader(t *testing.T) {
+	for _, api := range apis {
+		t.Run(api.name, func(t *testing.T) {
+			scenes := map[string]*scene.Scene{"scene": gputest.Scene(), "affine": gputest.TransformedScene(), "masked-clips": gputest.MaskedClipScene(), "corner-clips": gputest.CornerClipScene()}
+			w, h := 0, 0
+			for _, s := range scenes {
+				w, h = max(w, s.Width), max(h, s.Height)
+			}
+			read := offscreen(t, api.es, w, h)
+			r, err := New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Release()
+			render := func(s *scene.Scene, general bool) []byte {
+				r.b.NoClasses = general
+				// Twice: the second frame finds what the first made (masks, programs).
+				for range 2 {
+					if err := r.Render(s); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return read()
+			}
+			specialized := map[gpu.Class]bool{}
+			for name, s := range scenes {
+				want := render(s, true)
+				got := render(s, false)
+				for _, bt := range r.b.Batches {
+					if bt.Class != gpu.ClassGeneral && bt.Joined == 0 && bt.Effect == nil {
+						if r.classes[bt.Class].program == 0 {
+							t.Errorf("%s: class %d has no program", name, bt.Class)
+						}
+						specialized[bt.Class] = true
+					}
+				}
+				different, largest := 0, 0
+				for i := range got {
+					d := int(got[i]) - int(want[i])
+					if d < 0 {
+						d = -d
+					}
+					if d != 0 {
+						different++
+						largest = max(largest, d)
+					}
+				}
+				if largest > 2 {
+					t.Errorf("%s: %d bytes differ from the general shader's; largest channel delta %d", name, different, largest)
+				}
+			}
+			t.Logf("classes drawn with their programs: %v", specialized)
+			for _, cl := range []gpu.Class{gpu.ClassPlain, gpu.ClassFill} {
+				if !specialized[cl] {
+					t.Errorf("no batch drew with class %d's program", cl)
+				}
 			}
 		})
 	}

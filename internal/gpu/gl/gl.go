@@ -116,6 +116,14 @@ type canvasTexture struct {
 	canvas weak.Pointer[scene.Image]
 }
 
+// classProgram is the program of a gpu.Class and its uSize, or failed
+// when it did not link, its batches drawing with the general program.
+type classProgram struct {
+	program uint32
+	uSize   int32
+	failed  bool
+}
+
 // Renderer draws scenes into the framebuffer bound when Render is called,
 // with the GL context that was current when New was called. All its
 // methods must be called with that context current.
@@ -131,6 +139,10 @@ type Renderer struct {
 	program  uint32
 	vao, buf uint32
 	uSize    int32
+	// classes are the programs of the classes other than the general one
+	// (gpu.Class), each holding only that class's path of the fragment
+	// shader, linked as a batch of the class is first drawn.
+	classes [gpu.NumClasses]classProgram
 	mask     texture
 	color    texture
 	empty    uint32 // a texture to bind where there is none
@@ -279,15 +291,9 @@ func (r *Renderer) init() error {
 	if glGetProgramiv(r.program, glLinkStatus, &ok); ok == 0 {
 		return fmt.Errorf("gl: cannot link the shader: %s", programLog(r.program))
 	}
-	glUseProgram(r.program)
-	r.uSize = glGetUniformLocation(r.program, "uSize")
-	glUniform1i(glGetUniformLocation(r.program, "uMask"), 0)
-	glUniform1i(glGetUniformLocation(r.program, "uColor"), 1)
-	glUniform1i(glGetUniformLocation(r.program, "uImage"), 2)
-	glUniform1i(glGetUniformLocation(r.program, "uClipMask"), 4)
-	glUniform1i(glGetUniformLocation(r.program, "uStops"), stopsUnit)
-	glUniform1i(glGetUniformLocation(r.program, "uChroma"), chromaUnit)
+	r.uSize = bindSamplers(r.program)
 	glUseProgram(0)
+	r.b.Classes = true
 	if r.down, err = passLink(header, "DOWN"); err != nil {
 		return err
 	}
@@ -413,6 +419,41 @@ func link(vertex, fragment string) (uint32, error) {
 		return 0, err
 	}
 	return program, nil
+}
+
+// bindSamplers makes program current, gives its samplers their texture
+// units, and returns the location of its uSize.
+func bindSamplers(program uint32) int32 {
+	glUseProgram(program)
+	glUniform1i(glGetUniformLocation(program, "uMask"), 0)
+	glUniform1i(glGetUniformLocation(program, "uColor"), 1)
+	glUniform1i(glGetUniformLocation(program, "uImage"), 2)
+	glUniform1i(glGetUniformLocation(program, "uClipMask"), 4)
+	glUniform1i(glGetUniformLocation(program, "uStops"), stopsUnit)
+	glUniform1i(glGetUniformLocation(program, "uChroma"), chromaUnit)
+	return glGetUniformLocation(program, "uSize")
+}
+
+// classProgram returns the program of class cl, linking it the first
+// time, or 0 for the general class and a class whose program did not link,
+// which draw with r.program. It leaves the program current.
+func (r *Renderer) classProgram(cl gpu.Class) *classProgram {
+	if cl == gpu.ClassGeneral || int(cl) >= len(r.classes) {
+		return nil
+	}
+	p := &r.classes[cl]
+	if p.program == 0 && !p.failed {
+		program, err := link(r.header+"#define VERTEX\n"+shaderSource, r.header+fmt.Sprintf("#define FRAGMENT\n#define CLASS %d\n", cl)+shaderSource)
+		if err != nil {
+			p.failed = true
+			return nil
+		}
+		p.program, p.uSize = program, bindSamplers(program)
+	}
+	if p.failed {
+		return nil
+	}
+	return p
 }
 
 // passLink compiles and links the program of a pass computing backdrops,
@@ -742,16 +783,28 @@ func (r *Renderer) drawFrame(s *scene.Scene) error {
 // batchKey returns what batch i of the frame built draws with: its
 // program and blending (gpu.Pipelines).
 func (r *Renderer) batchKey(i int) uint64 {
-	bt := &r.b.Batches[i]
-	program := r.program
-	if bt.Effect != nil {
-		program = r.effectProgram(bt.Effect).program
-	}
+	program, _ := r.batchProgram(&r.b.Batches[i])
 	key := uint64(program) << 1
-	if bt.Hole {
+	if r.b.Batches[i].Hole {
 		key |= 1
 	}
 	return key
+}
+
+// batchProgram returns the program batch bt draws with, and the location of
+// its uSize unless an effect's (or -1): its effect's, its class's (a batch
+// that joined others', Joined, holds instances of several and takes the
+// general one), or the general one. 0 is an effect's that did not link.
+func (r *Renderer) batchProgram(bt *gpu.Batch) (uint32, int32) {
+	if bt.Effect != nil {
+		return r.effectProgram(bt.Effect).program, -1
+	}
+	if bt.Joined == 0 {
+		if p := r.classProgram(bt.Class); p != nil {
+			return p.program, p.uSize
+		}
+	}
+	return r.program, r.uSize
 }
 
 // drawCanvases draws the canvases s draws anew or shows into their
@@ -779,6 +832,7 @@ func (r *Renderer) drawCanvas(c *scene.Image) error {
 	t := r.canvases[c.ID()]
 	if t == nil {
 		t = &canvasTexture{canvas: weak.Make(c)}
+		t.b.Classes = true
 		r.canvases[c.ID()] = t
 	}
 	t.lastFrame = r.frame // drawn or shown: the sweep keeps a transient canvas's texture
@@ -901,13 +955,9 @@ func (r *Renderer) drawBuilt(s *scene.Scene, b *gpu.Builder, part *gpu.Part) err
 		if bt.Count == 0 || !meets(sc, areas) {
 			continue
 		}
-		want := r.program
-		if bt.Effect != nil {
-			p := r.effectProgram(bt.Effect)
-			if p.program == 0 {
-				continue
-			}
-			want = p.program
+		want, wantSize := r.batchProgram(&bt)
+		if want == 0 {
+			continue
 		}
 		if bt.Backdrop != 0 {
 			// The effect shows what is drawn so far.
@@ -929,6 +979,8 @@ func (r *Renderer) drawBuilt(s *scene.Scene, b *gpu.Builder, part *gpu.Part) err
 			glUseProgram(program)
 			if bt.Effect != nil {
 				glUniform2f(r.effects[bt.Effect].uSize, float32(s.Width), float32(s.Height))
+			} else if wantSize >= 0 {
+				glUniform2f(wantSize, float32(s.Width), float32(s.Height))
 			}
 		}
 		if bt.Image != 0 && bt.Image != bound {
@@ -1258,6 +1310,7 @@ func or(a, b uint32) uint32 {
 func (r *Renderer) forget() {
 	r.program, r.vao, r.buf, r.empty, r.ubo = 0, 0, 0, 0, 0
 	r.down, r.blur, r.passVAO = passProgram{}, passProgram{}, 0
+	r.classes = [gpu.NumClasses]classProgram{}
 	clear(r.effects)
 	r.grab, r.backdrop, r.backdropFB = texture{}, [2]texture{}, [2]uint32{}
 	r.mask, r.color = texture{}, texture{}
@@ -1331,6 +1384,11 @@ func (r *Renderer) Release() {
 	for _, p := range []uint32{r.down.program, r.blur.program} {
 		if p != 0 {
 			glDeleteProgram(p)
+		}
+	}
+	for _, p := range r.classes {
+		if p.program != 0 {
+			glDeleteProgram(p.program)
 		}
 	}
 	if r.passVAO != 0 {
