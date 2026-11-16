@@ -282,6 +282,15 @@ float textCoverage(float a, vec3 c, float contrast, float boost, vec4 g) {
 // above.
 #ifdef FRAGMENT
 
+// CLASS is the gpu.Class the program draws: 0, the general class, holds
+// every path; another only that class's, as Metal's function constants and
+// Direct3D's macros specialize theirs. The whole shader needs more
+// registers than a small GPU has (a Mali-G52 ran it on one thread, spilling
+// to memory), and every fill paid for them.
+#ifndef CLASS
+#define CLASS 0
+#endif
+
 // The chroma of an image that is a frame of video in NV12, whose luma
 // uImage holds (gpu.ImageYUV).
 uniform sampler2D uChroma;
@@ -520,6 +529,14 @@ void main() {
 	vec2 dtex = fwidth(tex);
 	float kind = vParams.x;
 	vec4 res;
+#if CLASS == 1
+	// A plain fill (gpu.ClassPlain): solid, without a border, not transformed.
+	fragColor = premul(vColor) * rectCoverage(p, vRect, vRadii) * clipCoverage() * vParams.w;
+#ifdef DUAL
+	fragAlpha = fragColor.aaaa;
+#endif
+	return;
+#else
 	float glyphCov = vTransform0.w > 0.5 ? localCoverage(p, vRect, vec4(0.0), 1.0, fr) : 1.0;
 	float clip = clipCoverage();
 	// The dispatch below is a chain of ifs with early returns, not one else-if chain:
@@ -527,6 +544,7 @@ void main() {
 	// empty info log, and every WebGL context in the page is lost; Firefox's headless
 	// build exits at the link). See https://issues.chromium.org/issues/573007971 and
 	// https://bugzilla.mozilla.org/show_bug.cgi?id=2081240. The shape is load-bearing.
+#if CLASS == 0 || CLASS == 2
 	if (kind < 0.5) {
 		float outer = localCoverage(p, vRect, vRadii, vTransform0.w, fr);
 		// vParams.y: 1 dashes the border, 2 paints it with the gradient (the
@@ -552,6 +570,8 @@ void main() {
 #endif
 		return;
 	}
+#endif
+#if CLASS == 0 || CLASS == 3
 	if (kind < 1.5 && vParams.y > 0.5) {
 		// An inner shadow: inside the box, what the hole, blurred, leaves.
 		float sigma = vParams.z;
@@ -582,6 +602,8 @@ void main() {
 #endif
 		return;
 	}
+#endif
+#if CLASS == 0 || CLASS == 4
 	if (kind < 2.5) {
 		vec4 c = paint(p, vParams.z, vRect, vColor, vColor2, vGrad);
 		res = c *
@@ -594,6 +616,8 @@ void main() {
 #endif
 		return;
 	}
+#endif
+#if CLASS == 0 || CLASS == 6
 	if (kind < 3.5) {
 		res = sampleLocal(uColor, tex, vWidths, vTransform0.w) * vColor.a * glyphCov;
 		fragColor = res * clip * vParams.w;
@@ -630,6 +654,8 @@ void main() {
 #endif
 		return;
 	}
+#endif
+#if CLASS == 0 || CLASS == 5
 	{
 		vec4 c = paint(p, vParams.z, vRect, vColor, vColor2, vGrad);
 		vec3 straight = unpremul(c);
@@ -655,6 +681,13 @@ void main() {
 #endif
 		return;
 	}
+#endif
+	// Past the class's own paths: none of its instances get here.
+	fragColor = vec4(0.0);
+#ifdef DUAL
+	fragAlpha = vec4(0.0);
+#endif
+#endif
 }
 
 #endif
